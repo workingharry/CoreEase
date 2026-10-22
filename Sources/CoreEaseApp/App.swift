@@ -24,12 +24,11 @@ struct CoreEaseApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Bring app into activation policy if opened as window
         NSApp.setActivationPolicy(.regular)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return false // Stay running in menu bar
+        return false // Keep running in menu bar
     }
 }
 
@@ -50,20 +49,46 @@ final class ProcessViewModel: ObservableObject {
     @Published var sortMode: ProcessSortMode = .name
 
     private var timer: AnyCancellable?
+    private let policyStore = ThrottlePolicyStore.shared
 
     init() {
         refresh()
-        timer = Timer.publish(every: 2.0, on: .main, in: .common)
+        // Adaptive Cadence (engineered-flow Energy & Battery audit):
+        // 2.5s cadence to preserve MacBook battery during background tracking
+        timer = Timer.publish(every: 2.5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 if self?.autoRefresh == true {
                     self?.refresh()
                 }
             }
+
+        // Listen for system sleep to halt and resume safely
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.autoRefresh = false
+            }
+        }
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.autoRefresh = true
+                self?.refresh()
+            }
+        }
     }
 
     func refresh() {
         let fetched = ProcessMonitor.shared.getTopProcesses(limit: 50)
+        let savedPolicies = policyStore.getAllPolicies()
 
         var currentMap: [Int32: TrackedProcess] = [:]
         for p in processes {
@@ -72,13 +97,26 @@ final class ProcessViewModel: ObservableObject {
 
         var merged: [TrackedProcess] = []
         for newP in fetched {
-            if var existing = currentMap[newP.pid] {
-                existing.cpuUsage = newP.cpuUsage
-                existing.safetyTier = newP.safetyTier
-                merged.append(existing)
-            } else {
-                merged.append(newP)
+            var proc = newP
+
+            // Check if user has a persistent policy for this application
+            if let policy = savedPolicies[proc.name] {
+                proc.isEfficiencyClamped = policy.isEco
+                proc.throttleLimitPercent = policy.throttleLimitPercent
+
+                // Reapply active throttle/clamp if not currently running
+                if let limit = policy.throttleLimitPercent, !CPUThrottler.shared.isThrottling(pid: proc.pid) {
+                    CPUThrottler.shared.setLimit(pid: proc.pid, percent: limit)
+                }
+                if policy.isEco {
+                    CoreScheduler.shared.clampToEfficiencyCores(pid: proc.pid)
+                }
+            } else if let existing = currentMap[proc.pid] {
+                proc.isEfficiencyClamped = existing.isEfficiencyClamped
+                proc.throttleLimitPercent = existing.throttleLimitPercent
             }
+
+            merged.append(proc)
         }
 
         switch sortMode {
@@ -103,31 +141,61 @@ final class ProcessViewModel: ObservableObject {
         }
     }
 
-    func clampToEco(pid: Int32) {
+    func clampToEco(pid: Int32, appName: String) {
         _ = CoreScheduler.shared.clampToEfficiencyCores(pid: pid)
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].isEfficiencyClamped = true
         }
+
+        // Persist policy
+        var policy = policyStore.getPolicy(for: appName) ?? AppThrottlePolicy(appName: appName)
+        policy.isEco = true
+        policyStore.setPolicy(policy)
     }
 
-    func resetToTurbo(pid: Int32) {
+    func resetToTurbo(pid: Int32, appName: String) {
         _ = CoreScheduler.shared.resetToDefaultCores(pid: pid)
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].isEfficiencyClamped = false
         }
+
+        // Update persistent policy
+        if var policy = policyStore.getPolicy(for: appName) {
+            policy.isEco = false
+            if policy.throttleLimitPercent == nil {
+                policyStore.removePolicy(for: appName)
+            } else {
+                policyStore.setPolicy(policy)
+            }
+        }
     }
 
-    func setLimit(pid: Int32, percent: Int) {
+    func setLimit(pid: Int32, appName: String, percent: Int) {
         CPUThrottler.shared.setLimit(pid: pid, percent: percent)
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].throttleLimitPercent = percent
         }
+
+        // Persist policy permanently for this app name
+        var policy = policyStore.getPolicy(for: appName) ?? AppThrottlePolicy(appName: appName)
+        policy.throttleLimitPercent = percent
+        policyStore.setPolicy(policy)
     }
 
-    func removeLimit(pid: Int32) {
+    func removeLimit(pid: Int32, appName: String) {
         CPUThrottler.shared.stopThrottling(pid: pid)
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].throttleLimitPercent = nil
+        }
+
+        // Update persistent policy
+        if var policy = policyStore.getPolicy(for: appName) {
+            policy.throttleLimitPercent = nil
+            if !policy.isEco {
+                policyStore.removePolicy(for: appName)
+            } else {
+                policyStore.setPolicy(policy)
+            }
         }
     }
 
@@ -143,11 +211,8 @@ struct LaunchWindowView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Distinctive Header & Brand Identity per /frontend-design
             AppBrandHeader(model: model, isMainWindow: true)
-
             Divider()
-
             ContentView(model: model)
         }
         .frame(minWidth: 600, minHeight: 600)
@@ -161,7 +226,6 @@ struct AppBrandHeader: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
-            // Intentional Brand Mark: Apple Silicon Dual-Core Geometry
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(LinearGradient(colors: [Color(red: 0.12, green: 0.38, blue: 0.34), Color(red: 0.08, green: 0.22, blue: 0.25)], startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -198,7 +262,6 @@ struct AppBrandHeader: View {
 
             Spacer()
 
-            // Quit Button
             Button(action: { model.quitApplication() }) {
                 HStack(spacing: 4) {
                     Image(systemName: "power")
@@ -227,12 +290,9 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Brand strip (for menu bar popover)
             AppBrandHeader(model: model, isMainWindow: false)
 
-            // Toolbar Controls
             HStack(spacing: 10) {
-                // Search Input
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundColor(.secondary)
@@ -244,7 +304,6 @@ struct ContentView: View {
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(7)
 
-                // Refresh Button
                 Button(action: { model.refresh() }) {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .medium))
@@ -255,7 +314,6 @@ struct ContentView: View {
                 .cornerRadius(7)
                 .help("Refresh task list")
 
-                // Open in Full Window Button
                 Button(action: {
                     openWindow(id: "main-dashboard")
                     NSApp.activate(ignoringOtherApps: true)
@@ -269,7 +327,6 @@ struct ContentView: View {
                 .cornerRadius(7)
                 .help("Open in standalone Launch Dashboard window")
 
-                // Settings Toggle
                 Button(action: { showSettings.toggle() }) {
                     Image(systemName: showSettings ? "gearshape.fill" : "gearshape")
                         .font(.system(size: 12, weight: .medium))
@@ -284,7 +341,6 @@ struct ContentView: View {
             .padding(.vertical, 8)
             .background(Color(NSColor.windowBackgroundColor))
 
-            // Expandable Settings Drawer
             if showSettings {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -316,7 +372,6 @@ struct ContentView: View {
 
             Divider()
 
-            // Process List (Fixed Position, in-place updates)
             ScrollView {
                 LazyVStack(spacing: 8) {
                     if model.filteredProcesses.isEmpty {
@@ -340,7 +395,6 @@ struct ContentView: View {
 
             Divider()
 
-            // Footer Status Bar
             HStack {
                 HStack(spacing: 4) {
                     Circle()
@@ -371,18 +425,25 @@ struct ProcessCard: View {
     let proc: TrackedProcess
     @ObservedObject var model: ProcessViewModel
 
-    @State private var isEco: Bool = false
-    // 70% default CPU limit
-    @State private var limitPercent: Double = 70.0
-    @State private var isThrottled: Bool = false
-
     var isProtected: Bool {
         return proc.safetyTier == .protectedSystem
     }
 
+    // Direct binding to model's tracked state to prevent state loss on popover recreate
+    var isEco: Bool {
+        return proc.isEfficiencyClamped
+    }
+
+    var isThrottled: Bool {
+        return proc.throttleLimitPercent != nil
+    }
+
+    var limitPercent: Double {
+        return Double(proc.throttleLimitPercent ?? 70)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            // Process Header
             HStack(spacing: 8) {
                 Image(systemName: proc.safetyTier.badgeIcon)
                     .foregroundColor(proc.safetyTier == .protectedSystem ? .red : (proc.safetyTier == .cautionDaemon ? .orange : .green))
@@ -400,15 +461,13 @@ struct ProcessCard: View {
                     .foregroundColor(proc.cpuUsage > 50 ? .orange : .primary)
             }
 
-            // Controls
             HStack(spacing: 8) {
                 // E-Core Clamp Toggle
                 Button(action: {
-                    isEco.toggle()
                     if isEco {
-                        model.clampToEco(pid: proc.pid)
+                        model.resetToTurbo(pid: proc.pid, appName: proc.name)
                     } else {
-                        model.resetToTurbo(pid: proc.pid)
+                        model.clampToEco(pid: proc.pid, appName: proc.name)
                     }
                 }) {
                     HStack(spacing: 4) {
@@ -426,37 +485,43 @@ struct ProcessCard: View {
 
                 Spacer()
 
-                // Limit CPU Toggle (Protected check)
                 if isProtected {
                     Text("🛡️ System Protected")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.red)
                 } else {
-                    Toggle(isOn: $isThrottled) {
+                    Toggle(isOn: Binding(
+                        get: { isThrottled },
+                        set: { active in
+                            if active {
+                                model.setLimit(pid: proc.pid, appName: proc.name, percent: Int(limitPercent))
+                            } else {
+                                model.removeLimit(pid: proc.pid, appName: proc.name)
+                            }
+                        }
+                    )) {
                         Text(isThrottled ? "Limit: \(Int(limitPercent))%" : "Limit CPU")
                             .font(.system(size: 10))
                     }
                     .toggleStyle(.checkbox)
-                    .onChange(of: isThrottled) { active in
-                        if active {
-                            model.setLimit(pid: proc.pid, percent: Int(limitPercent))
-                        } else {
-                            model.removeLimit(pid: proc.pid)
-                        }
-                    }
                 }
             }
 
-            // Slider view if throttled
             if isThrottled && !isProtected {
                 HStack(spacing: 6) {
                     Text("Cap:")
                         .font(.caption2)
                         .foregroundColor(.secondary)
-                    Slider(value: $limitPercent, in: 10...90, step: 5)
-                        .onChange(of: limitPercent) { newVal in
-                            model.setLimit(pid: proc.pid, percent: Int(newVal))
-                        }
+                    Slider(
+                        value: Binding(
+                            get: { limitPercent },
+                            set: { newVal in
+                                model.setLimit(pid: proc.pid, appName: proc.name, percent: Int(newVal))
+                            }
+                        ),
+                        in: 10...90,
+                        step: 5
+                    )
                     Text("\(Int(limitPercent))%")
                         .font(.system(size: 10, design: .monospaced))
                         .frame(width: 32)
