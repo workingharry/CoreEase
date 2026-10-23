@@ -62,7 +62,7 @@ public struct ProcessSafetyEvaluator: Sendable {
     public static func evaluate(name: String) -> ProcessSafetyTier {
         if protectedServices.contains(name) {
             return .protectedSystem
-        } else if cautionServices.contains(name) || name.hasSuffix("d") {
+        } else if cautionServices.contains(name) || (name.hasSuffix("d") && !name.contains(" ")) {
             return .cautionDaemon
         }
         return .safeApp
@@ -137,12 +137,13 @@ public final class CPUThrottler: @unchecked Sendable {
 
     public init() {}
 
-    /// Starts throttling a process to a target maximum CPU percentage (10% - 90%)
+    /// Starts throttling a process to a target maximum CPU percentage (10% - 95%)
     public func setLimit(pid: Int32, percent: Int) {
         stopThrottling(pid: pid)
 
-        let clampedPercent = max(5, min(95, percent))
-        let cycleDurationMs: Double = 100.0 // 100ms total cycle
+        let clampedPercent = max(10, min(95, percent))
+        // 20ms cycle duration for smooth, stutter-free 60-120Hz ProMotion display rendering
+        let cycleDurationMs: Double = 20.0
         let workDurationMs = cycleDurationMs * (Double(clampedPercent) / 100.0)
         let sleepDurationMs = cycleDurationMs - workDurationMs
 

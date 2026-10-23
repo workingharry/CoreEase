@@ -622,7 +622,7 @@ struct ProcessCard: View {
         if let limit = proc.throttleLimitPercent {
             return Double(limit)
         }
-        return isAutoSuppressed ? Double(model.autoSuppressConfig.autoThrottleLimit) : 70.0
+        return isAutoSuppressed ? Double(model.autoSuppressConfig.autoThrottleLimit) : 85.0
     }
 
     var body: some View {
