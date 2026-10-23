@@ -8,15 +8,15 @@ struct CoreEaseApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("CoreEase", systemImage: "cpu") {
+        MenuBarExtra("CoreEase", systemImage: model.isAutoSuppressionActive ? "leaf.arrow.triangle.circlepath" : "cpu") {
             ContentView(model: model)
-                .frame(width: 480, height: 560)
+                .frame(width: 490, height: 580)
         }
         .menuBarExtraStyle(.window)
 
         Window("CoreEase Dashboard", id: "main-dashboard") {
             LaunchWindowView(model: model)
-                .frame(minWidth: 640, minHeight: 580)
+                .frame(minWidth: 640, minHeight: 620)
         }
         .windowResizability(.contentSize)
     }
@@ -48,13 +48,26 @@ final class ProcessViewModel: ObservableObject {
     @Published var showSystemServices: Bool = false
     @Published var sortMode: ProcessSortMode = .name
 
+    // Battery & Auto-Suppression Configuration
+    @Published var autoSuppressConfig = AutoSuppressConfig()
+    @Published var isOnBattery: Bool = false
+    @Published var autoSuppressedPIDs: Set<Int32> = []
+
     private var timer: AnyCancellable?
     private let policyStore = ThrottlePolicyStore.shared
+    private var suppressionEngine = AutoSuppressionEngine()
+
+    var isAutoSuppressionActive: Bool {
+        return autoSuppressConfig.enabled && !autoSuppressedPIDs.isEmpty
+    }
 
     init() {
+        self.isOnBattery = PowerSourceMonitor.isOnBattery()
+        self.suppressionEngine = AutoSuppressionEngine(config: autoSuppressConfig)
+
         refresh()
-        // Adaptive Cadence (engineered-flow Energy & Battery audit):
-        // 2.5s cadence to preserve MacBook battery during background tracking
+
+        // 2.5s Adaptive cadence for battery conservation
         timer = Timer.publish(every: 2.5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -63,7 +76,25 @@ final class ProcessViewModel: ObservableObject {
                 }
             }
 
-        // Listen for system sleep to halt and resume safely
+        // Frontmost active application change notification
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self = self else { return }
+            if let app = notif.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                Task { @MainActor in
+                    let restored = self.suppressionEngine.updateFrontmostApp(pid: app.processIdentifier)
+                    for action in restored {
+                        self.executeRestore(pid: action.pid)
+                    }
+                    self.autoSuppressedPIDs = Set(self.processes.filter { self.suppressionEngine.isAutoSuppressed(pid: $0.pid) }.map { $0.pid })
+                }
+            }
+        }
+
+        // Display sleep / wake observation
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.screensDidSleepNotification,
             object: nil,
@@ -86,7 +117,23 @@ final class ProcessViewModel: ObservableObject {
         }
     }
 
+    func updateAutoSuppressConfig(_ newConfig: AutoSuppressConfig) {
+        self.autoSuppressConfig = newConfig
+        self.suppressionEngine.config = newConfig
+        if !newConfig.enabled {
+            let restored = suppressionEngine.restoreAll()
+            for action in restored {
+                executeRestore(pid: action.pid)
+            }
+            autoSuppressedPIDs.removeAll()
+        }
+    }
+
     func refresh() {
+        self.isOnBattery = PowerSourceMonitor.isOnBattery()
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        _ = suppressionEngine.updateFrontmostApp(pid: frontPID)
+
         let fetched = ProcessMonitor.shared.getTopProcesses(limit: 50)
         let savedPolicies = policyStore.getAllPolicies()
 
@@ -99,12 +146,11 @@ final class ProcessViewModel: ObservableObject {
         for newP in fetched {
             var proc = newP
 
-            // Check if user has a persistent policy for this application
+            // Check persistent user manual policies
             if let policy = savedPolicies[proc.name] {
                 proc.isEfficiencyClamped = policy.isEco
                 proc.throttleLimitPercent = policy.throttleLimitPercent
 
-                // Reapply active throttle/clamp if not currently running
                 if let limit = policy.throttleLimitPercent, !CPUThrottler.shared.isThrottling(pid: proc.pid) {
                     CPUThrottler.shared.setLimit(pid: proc.pid, percent: limit)
                 }
@@ -119,6 +165,21 @@ final class ProcessViewModel: ObservableObject {
             merged.append(proc)
         }
 
+        // Evaluate automated high-load suppression
+        if autoSuppressConfig.enabled {
+            let actions = suppressionEngine.evaluate(processes: merged, isOnBattery: self.isOnBattery)
+            for action in actions {
+                if action.action == .suppress {
+                    executeSuppression(pid: action.pid)
+                } else {
+                    executeRestore(pid: action.pid)
+                }
+            }
+            self.autoSuppressedPIDs = Set(merged.filter { suppressionEngine.isAutoSuppressed(pid: $0.pid) }.map { $0.pid })
+        } else {
+            self.autoSuppressedPIDs.removeAll()
+        }
+
         switch sortMode {
         case .name:
             self.processes = merged.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -126,6 +187,26 @@ final class ProcessViewModel: ObservableObject {
             self.processes = merged.sorted { $0.pid < $1.pid }
         case .cpu:
             self.processes = merged.sorted { $0.cpuUsage > $1.cpuUsage }
+        }
+    }
+
+    private func executeSuppression(pid: Int32) {
+        if autoSuppressConfig.autoEcoClamp {
+            CoreScheduler.shared.clampToEfficiencyCores(pid: pid)
+        }
+        CPUThrottler.shared.setLimit(pid: pid, percent: autoSuppressConfig.autoThrottleLimit)
+    }
+
+    private func executeRestore(pid: Int32) {
+        // If user has no manual policy, restore process to full default speed
+        if let proc = processes.first(where: { $0.pid == pid }) {
+            if policyStore.getPolicy(for: proc.name) == nil {
+                CPUThrottler.shared.stopThrottling(pid: pid)
+                CoreScheduler.shared.resetToDefaultCores(pid: pid)
+            }
+        } else {
+            CPUThrottler.shared.stopThrottling(pid: pid)
+            CoreScheduler.shared.resetToDefaultCores(pid: pid)
         }
     }
 
@@ -146,8 +227,6 @@ final class ProcessViewModel: ObservableObject {
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].isEfficiencyClamped = true
         }
-
-        // Persist policy
         var policy = policyStore.getPolicy(for: appName) ?? AppThrottlePolicy(appName: appName)
         policy.isEco = true
         policyStore.setPolicy(policy)
@@ -158,8 +237,6 @@ final class ProcessViewModel: ObservableObject {
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].isEfficiencyClamped = false
         }
-
-        // Update persistent policy
         if var policy = policyStore.getPolicy(for: appName) {
             policy.isEco = false
             if policy.throttleLimitPercent == nil {
@@ -175,8 +252,6 @@ final class ProcessViewModel: ObservableObject {
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].throttleLimitPercent = percent
         }
-
-        // Persist policy permanently for this app name
         var policy = policyStore.getPolicy(for: appName) ?? AppThrottlePolicy(appName: appName)
         policy.throttleLimitPercent = percent
         policyStore.setPolicy(policy)
@@ -187,8 +262,6 @@ final class ProcessViewModel: ObservableObject {
         if let idx = processes.firstIndex(where: { $0.pid == pid }) {
             processes[idx].throttleLimitPercent = nil
         }
-
-        // Update persistent policy
         if var policy = policyStore.getPolicy(for: appName) {
             policy.throttleLimitPercent = nil
             if !policy.isEco {
@@ -215,7 +288,7 @@ struct LaunchWindowView: View {
             Divider()
             ContentView(model: model)
         }
-        .frame(minWidth: 600, minHeight: 600)
+        .frame(minWidth: 620, minHeight: 620)
     }
 }
 
@@ -235,7 +308,7 @@ struct AppBrandHeader: View {
                             .stroke(Color.white.opacity(0.15), lineWidth: 1)
                     )
 
-                Image(systemName: "cpu.fill")
+                Image(systemName: model.isAutoSuppressionActive ? "leaf.arrow.triangle.circlepath" : "cpu.fill")
                     .foregroundColor(Color(red: 0.35, green: 0.90, blue: 0.72))
                     .font(.system(size: 18, weight: .semibold))
             }
@@ -253,6 +326,19 @@ struct AppBrandHeader: View {
                         .background(Color.accentColor.opacity(0.12))
                         .foregroundColor(.accentColor)
                         .clipShape(Capsule())
+
+                    if model.isOnBattery {
+                        HStack(spacing: 3) {
+                            Image(systemName: "battery.75")
+                            Text("Battery Mode")
+                        }
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.green)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.12))
+                        .clipShape(Capsule())
+                    }
                 }
 
                 Text("Intelligent Core Scheduling & Dynamic CPU Throttling")
@@ -292,6 +378,43 @@ struct ContentView: View {
         VStack(spacing: 0) {
             AppBrandHeader(model: model, isMainWindow: false)
 
+            // Auto-Suppression Intelligent Banner
+            HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: model.autoSuppressConfig.enabled ? "bolt.shield.fill" : "bolt.shield")
+                        .foregroundColor(model.autoSuppressConfig.enabled ? .green : .secondary)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Auto-Battery Saver (Auto-Suppress)")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(model.autoSuppressConfig.enabled
+                             ? (model.isOnBattery
+                                ? "Active: Auto-throttling background tasks >\(Int(model.autoSuppressConfig.cpuThreshold))% CPU to save battery"
+                                : "Armed: Will activate automatically when running on Battery")
+                             : "Disabled: Manual control mode")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { model.autoSuppressConfig.enabled },
+                    set: { val in
+                        var cfg = model.autoSuppressConfig
+                        cfg.enabled = val
+                        model.updateAutoSuppressConfig(cfg)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .scaleEffect(0.8)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color.accentColor.opacity(0.08))
+
+            // Toolbar Controls
             HStack(spacing: 10) {
                 HStack {
                     Image(systemName: "magnifyingglass")
@@ -335,14 +458,65 @@ struct ContentView: View {
                 .padding(7)
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(7)
-                .help("Settings & System Services")
+                .help("Settings & Automation Rules")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .background(Color(NSColor.windowBackgroundColor))
 
+            // Expandable Settings Drawer
             if showSettings {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Auto-Suppression Rules")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.secondary)
+
+                    HStack {
+                        Toggle("Only on Battery Power", isOn: Binding(
+                            get: { model.autoSuppressConfig.onlyOnBattery },
+                            set: { val in
+                                var cfg = model.autoSuppressConfig
+                                cfg.onlyOnBattery = val
+                                model.updateAutoSuppressConfig(cfg)
+                            }
+                        ))
+                        .font(.caption)
+
+                        Spacer()
+
+                        Toggle("Pin to E-Cores (Eco)", isOn: Binding(
+                            get: { model.autoSuppressConfig.autoEcoClamp },
+                            set: { val in
+                                var cfg = model.autoSuppressConfig
+                                cfg.autoEcoClamp = val
+                                model.updateAutoSuppressConfig(cfg)
+                            }
+                        ))
+                        .font(.caption)
+                    }
+
+                    HStack {
+                        Text("Trigger Threshold:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Slider(
+                            value: Binding(
+                                get: { model.autoSuppressConfig.cpuThreshold },
+                                set: { val in
+                                    var cfg = model.autoSuppressConfig
+                                    cfg.cpuThreshold = val
+                                    model.updateAutoSuppressConfig(cfg)
+                                }
+                            ),
+                            in: 50...90,
+                            step: 5
+                        )
+                        Text(">\(Int(model.autoSuppressConfig.cpuThreshold))% CPU")
+                            .font(.system(size: 10, design: .monospaced))
+                    }
+
+                    Divider()
+
                     HStack {
                         Text("Sort Order:")
                             .font(.caption)
@@ -386,7 +560,11 @@ struct ContentView: View {
                         .padding(.top, 40)
                     } else {
                         ForEach(model.filteredProcesses) { proc in
-                            ProcessCard(proc: proc, model: model)
+                            ProcessCard(
+                                proc: proc,
+                                model: model,
+                                isAutoSuppressed: model.autoSuppressedPIDs.contains(proc.pid)
+                            )
                         }
                     }
                 }
@@ -398,9 +576,11 @@ struct ContentView: View {
             HStack {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(Color.green)
+                        .fill(model.isAutoSuppressionActive ? Color.green : Color.secondary)
                         .frame(width: 6, height: 6)
-                    Text("🌿 Eco: Apple Silicon Efficiency Cores")
+                    Text(model.isAutoSuppressionActive
+                         ? "🛡️ Auto-suppressing \(model.autoSuppressedPIDs.count) heavy background app(s)"
+                         : "🌿 Eco Mode: Apple Silicon Efficiency Cores")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.secondary)
                 }
@@ -424,22 +604,25 @@ struct ContentView: View {
 struct ProcessCard: View {
     let proc: TrackedProcess
     @ObservedObject var model: ProcessViewModel
+    var isAutoSuppressed: Bool = false
 
     var isProtected: Bool {
         return proc.safetyTier == .protectedSystem
     }
 
-    // Direct binding to model's tracked state to prevent state loss on popover recreate
     var isEco: Bool {
-        return proc.isEfficiencyClamped
+        return proc.isEfficiencyClamped || isAutoSuppressed
     }
 
     var isThrottled: Bool {
-        return proc.throttleLimitPercent != nil
+        return proc.throttleLimitPercent != nil || isAutoSuppressed
     }
 
     var limitPercent: Double {
-        return Double(proc.throttleLimitPercent ?? 70)
+        if let limit = proc.throttleLimitPercent {
+            return Double(limit)
+        }
+        return isAutoSuppressed ? Double(model.autoSuppressConfig.autoThrottleLimit) : 70.0
     }
 
     var body: some View {
@@ -454,6 +637,19 @@ struct ProcessCard: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
 
+                if isAutoSuppressed {
+                    HStack(spacing: 3) {
+                        Image(systemName: "bolt.shield.fill")
+                        Text("Auto-Saved")
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(Color.green.opacity(0.15))
+                    .foregroundColor(.green)
+                    .clipShape(Capsule())
+                }
+
                 Spacer()
 
                 Text(String(format: "%.1f%% CPU", proc.cpuUsage))
@@ -462,7 +658,6 @@ struct ProcessCard: View {
             }
 
             HStack(spacing: 8) {
-                // E-Core Clamp Toggle
                 Button(action: {
                     if isEco {
                         model.resetToTurbo(pid: proc.pid, appName: proc.name)
