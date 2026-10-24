@@ -16,7 +16,7 @@ struct CoreEaseApp: App {
 
         Window("CoreEase Dashboard", id: "main-dashboard") {
             LaunchWindowView(model: model)
-                .frame(minWidth: 640, minHeight: 620)
+                .frame(minWidth: 620, minHeight: 620)
         }
         .windowResizability(.contentSize)
     }
@@ -28,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return false // Keep running in menu bar
+        return false
     }
 }
 
@@ -48,7 +48,6 @@ final class ProcessViewModel: ObservableObject {
     @Published var showSystemServices: Bool = false
     @Published var sortMode: ProcessSortMode = .name
 
-    // Battery & Auto-Suppression Configuration
     @Published var autoSuppressConfig = AutoSuppressConfig()
     @Published var isOnBattery: Bool = false
     @Published var autoSuppressedPIDs: Set<Int32> = []
@@ -67,7 +66,6 @@ final class ProcessViewModel: ObservableObject {
 
         refresh()
 
-        // 2.5s Adaptive cadence for battery conservation
         timer = Timer.publish(every: 2.5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -76,7 +74,6 @@ final class ProcessViewModel: ObservableObject {
                 }
             }
 
-        // Frontmost active application change notification
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -94,7 +91,6 @@ final class ProcessViewModel: ObservableObject {
             }
         }
 
-        // Display sleep / wake observation
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.screensDidSleepNotification,
             object: nil,
@@ -137,16 +133,15 @@ final class ProcessViewModel: ObservableObject {
         let fetched = ProcessMonitor.shared.getTopProcesses(limit: 50)
         let savedPolicies = policyStore.getAllPolicies()
 
-        var currentMap: [Int32: TrackedProcess] = [:]
-        for p in processes {
-            currentMap[p.pid] = p
-        }
+        // O(1) dictionary lookup map
+        let currentMap: [Int32: TrackedProcess] = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
 
         var merged: [TrackedProcess] = []
+        merged.reserveCapacity(fetched.count)
+
         for newP in fetched {
             var proc = newP
 
-            // Check persistent user manual policies
             if let policy = savedPolicies[proc.name] {
                 proc.isEfficiencyClamped = policy.isEco
                 proc.throttleLimitPercent = policy.throttleLimitPercent
@@ -165,7 +160,6 @@ final class ProcessViewModel: ObservableObject {
             merged.append(proc)
         }
 
-        // Evaluate automated high-load suppression
         if autoSuppressConfig.enabled {
             let actions = suppressionEngine.evaluate(processes: merged, isOnBattery: self.isOnBattery)
             for action in actions {
@@ -198,7 +192,6 @@ final class ProcessViewModel: ObservableObject {
     }
 
     private func executeRestore(pid: Int32) {
-        // If user has no manual policy, restore process to full default speed
         if let proc = processes.first(where: { $0.pid == pid }) {
             if policyStore.getPolicy(for: proc.name) == nil {
                 CPUThrottler.shared.stopThrottling(pid: pid)
@@ -211,7 +204,7 @@ final class ProcessViewModel: ObservableObject {
     }
 
     var filteredProcesses: [TrackedProcess] {
-        return processes.filter { proc in
+        processes.filter { proc in
             if !showSystemServices && proc.safetyTier != .safeApp {
                 return false
             }
@@ -283,19 +276,14 @@ struct LaunchWindowView: View {
     @ObservedObject var model: ProcessViewModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            AppBrandHeader(model: model, isMainWindow: true)
-            Divider()
-            ContentView(model: model)
-        }
-        .frame(minWidth: 620, minHeight: 620)
+        ContentView(model: model, isMainWindow: true)
+            .frame(minWidth: 620, minHeight: 620)
     }
 }
 
-/// Distinctive Brand Header with typography & palette
+/// Consolidated Header with Distinctive Brand Identity
 struct AppBrandHeader: View {
     @ObservedObject var model: ProcessViewModel
-    var isMainWindow: Bool = false
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
@@ -371,12 +359,13 @@ struct AppBrandHeader: View {
 
 struct ContentView: View {
     @ObservedObject var model: ProcessViewModel
+    var isMainWindow: Bool = false
     @State private var showSettings: Bool = false
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
-            AppBrandHeader(model: model, isMainWindow: false)
+            AppBrandHeader(model: model)
 
             // Auto-Suppression Intelligent Banner
             HStack(spacing: 10) {
@@ -437,18 +426,20 @@ struct ContentView: View {
                 .cornerRadius(7)
                 .help("Refresh task list")
 
-                Button(action: {
-                    openWindow(id: "main-dashboard")
-                    NSApp.activate(ignoringOtherApps: true)
-                }) {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 12, weight: .medium))
+                if !isMainWindow {
+                    Button(action: {
+                        openWindow(id: "main-dashboard")
+                        NSApp.activate(ignoringOtherApps: true)
+                    }) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(7)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(7)
+                    .help("Open in standalone Launch Dashboard window")
                 }
-                .buttonStyle(.plain)
-                .padding(7)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(7)
-                .help("Open in standalone Launch Dashboard window")
 
                 Button(action: { showSettings.toggle() }) {
                     Image(systemName: showSettings ? "gearshape.fill" : "gearshape")
@@ -464,7 +455,6 @@ struct ContentView: View {
             .padding(.vertical, 8)
             .background(Color(NSColor.windowBackgroundColor))
 
-            // Expandable Settings Drawer
             if showSettings {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Auto-Suppression Rules")
