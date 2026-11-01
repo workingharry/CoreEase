@@ -13,8 +13,8 @@ final class BatteryBypassEngineTests: XCTestCase {
             isCharging: true
         )
 
-        let result = engine.evaluateWithResult(diagnostics: diag)
-        XCTAssertEqual(result, .success(true))
+        let mode = engine.evaluateMode(diagnostics: diag)
+        XCTAssertEqual(mode, .hardwareInhibited(target: 80))
         XCTAssertTrue(mockSMC.isChargingInhibited())
     }
 
@@ -29,47 +29,36 @@ final class BatteryBypassEngineTests: XCTestCase {
             isCharging: false
         )
 
-        let result = engine.evaluateWithResult(diagnostics: diag)
-        XCTAssertEqual(result, .success(false))
+        let mode = engine.evaluateMode(diagnostics: diag)
+        XCTAssertEqual(mode, .hardwareResume(floor: 75))
         XCTAssertFalse(mockSMC.isChargingInhibited())
     }
 
-    func testBypassPropagatesNotPrivilegedErrorWhenPauseFails() {
-        let expectedError = SMCError.notPrivileged("Requires root privileges to open AppleSMC user client.")
+    func testBypassGracefullyFallsBackToNativePassthroughWhenSMCBlocked() {
+        let expectedError = SMCError.keyNotFound
         let mockSMC = MockSMCChargingController(inhibited: false, simulatedError: expectedError)
         let config = PowerBypassConfig(enabled: true, targetLimitPercent: 80, autoResumeChargeBelow: 75)
         let engine = BatteryBypassEngine(config: config, controller: mockSMC)
 
-        let diag = BatteryDiagnostics(
+        let diagNotCharging = BatteryDiagnostics(
             currentCapacityPercent: 85,
-            isExternalConnected: true,
-            isCharging: true
-        )
-
-        let result = engine.evaluateWithResult(diagnostics: diag)
-        XCTAssertEqual(result, .failure(expectedError))
-        XCTAssertFalse(mockSMC.isChargingInhibited())
-        XCTAssertTrue(expectedError.errorDescription?.contains("⚠️ Direct AC requires root privileges") == true)
-    }
-
-    func testBypassPropagatesErrorWhenDisablingInhibitionFails() {
-        let expectedError = SMCError.notPrivileged("SMC write blocked (0xe00002c1).")
-        let mockSMC = MockSMCChargingController(inhibited: true, simulatedError: expectedError)
-        let config = PowerBypassConfig(enabled: false, targetLimitPercent: 80, autoResumeChargeBelow: 75)
-        let engine = BatteryBypassEngine(config: config, controller: mockSMC)
-
-        let diag = BatteryDiagnostics(
-            currentCapacityPercent: 80,
             isExternalConnected: true,
             isCharging: false
         )
 
-        let result = engine.evaluateWithResult(diagnostics: diag)
-        XCTAssertEqual(result, .failure(expectedError))
-        XCTAssertTrue(mockSMC.isChargingInhibited())
+        let mode = engine.evaluateMode(diagnostics: diagNotCharging)
+        XCTAssertEqual(mode, .nativePassthroughActive)
+
+        let diagCharging = BatteryDiagnostics(
+            currentCapacityPercent: 78,
+            isExternalConnected: true,
+            isCharging: true
+        )
+        let modeCharging = engine.evaluateMode(diagnostics: diagCharging)
+        XCTAssertEqual(modeCharging, .nativePassthroughCharging(target: 80))
     }
 
-    func testBypassReturnsNilOnBatteryPowerWhenNotInhibited() {
+    func testBypassReturnsBatteryPowerWhenDisconnected() {
         let mockSMC = MockSMCChargingController(inhibited: false)
         let config = PowerBypassConfig(enabled: true, targetLimitPercent: 80, autoResumeChargeBelow: 75)
         let engine = BatteryBypassEngine(config: config, controller: mockSMC)
@@ -80,19 +69,18 @@ final class BatteryBypassEngineTests: XCTestCase {
             isCharging: false
         )
 
-        let result = engine.evaluateWithResult(diagnostics: diag)
-        XCTAssertEqual(result, .success(nil))
-        XCTAssertFalse(mockSMC.isChargingInhibited())
+        let mode = engine.evaluateMode(diagnostics: diag)
+        XCTAssertEqual(mode, .batteryPower)
     }
 
     func testSMCErrorDescriptions() {
-        let privErr = SMCError.notPrivileged("test reason")
-        XCTAssertEqual(privErr.errorDescription, "⚠️ Direct AC requires root privileges (test reason)")
+        let privErr = SMCError.notPrivileged("test")
+        XCTAssertEqual(privErr.errorDescription, "Requires root privileges (test)")
 
         let devErr = SMCError.deviceNotFound
-        XCTAssertEqual(devErr.errorDescription, "⚠️ Direct AC unavailable: AppleSMC device not found")
+        XCTAssertEqual(devErr.errorDescription, "AppleSMC device not found")
 
         let keyErr = SMCError.keyNotFound
-        XCTAssertEqual(keyErr.errorDescription, "⚠️ Direct AC unsupported: SMC key CH0B not found")
+        XCTAssertEqual(keyErr.errorDescription, "SMC key CH0B not found")
     }
 }

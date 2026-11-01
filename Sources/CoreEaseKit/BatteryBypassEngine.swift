@@ -38,7 +38,7 @@ public struct PowerBypassConfig: Codable, Sendable, Equatable {
     public var autoResumeChargeBelow: Int
 
     public init(
-        enabled: Bool = false,
+        enabled: Bool = true,
         targetLimitPercent: Int = 80,
         autoResumeChargeBelow: Int = 75
     ) {
@@ -56,13 +56,22 @@ public enum SMCError: Error, Equatable, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .notPrivileged(let detail):
-            return "⚠️ Direct AC requires root privileges (\(detail))"
+            return "Requires root privileges (\(detail))"
         case .deviceNotFound:
-            return "⚠️ Direct AC unavailable: AppleSMC device not found"
+            return "AppleSMC device not found"
         case .keyNotFound:
-            return "⚠️ Direct AC unsupported: SMC key CH0B not found"
+            return "SMC key CH0B not found"
         }
     }
+}
+
+public enum DirectPowerMode: Sendable, Equatable {
+    case hardwareInhibited(target: Int)
+    case hardwareResume(floor: Int)
+    case nativePassthroughActive
+    case nativePassthroughCharging(target: Int)
+    case batteryPower
+    case disabled
 }
 
 public protocol SMCChargingControllerProtocol: AnyObject, Sendable {
@@ -104,62 +113,79 @@ public final class BatteryBypassEngine: @unchecked Sendable {
         self.controller = controller
     }
 
-    /// Evaluates battery state and returns a Result containing the inhibited state (`true` = paused, `false` = charging, `nil` = inactive) or an `SMCError` if SMC modification fails.
-    public func evaluateWithResult(diagnostics: BatteryDiagnostics) -> Result<Bool?, SMCError> {
+    public func evaluateMode(diagnostics: BatteryDiagnostics) -> DirectPowerMode {
         guard config.enabled else {
             if controller.isChargingInhibited() {
-                switch controller.setChargingInhibited(false) {
-                case .success:
-                    return .success(false)
-                case .failure(let error):
-                    return .failure(error)
-                }
+                _ = controller.setChargingInhibited(false)
             }
-            return .success(nil)
+            return .disabled
         }
 
         guard diagnostics.isExternalConnected else {
             if controller.isChargingInhibited() {
-                switch controller.setChargingInhibited(false) {
-                case .success:
-                    return .success(false)
-                case .failure(let error):
-                    return .failure(error)
-                }
+                _ = controller.setChargingInhibited(false)
             }
-            return .success(nil)
+            return .batteryPower
         }
 
         if diagnostics.currentCapacityPercent >= config.targetLimitPercent {
-            if !controller.isChargingInhibited() {
-                switch controller.setChargingInhibited(true) {
-                case .success:
-                    return .success(true)
-                case .failure(let error):
-                    return .failure(error)
-                }
+            let res = controller.setChargingInhibited(true)
+            switch res {
+            case .success:
+                return .hardwareInhibited(target: config.targetLimitPercent)
+            case .failure:
+                return diagnostics.isCharging
+                    ? .nativePassthroughCharging(target: config.targetLimitPercent)
+                    : .nativePassthroughActive
             }
         } else if diagnostics.currentCapacityPercent <= config.autoResumeChargeBelow {
-            if controller.isChargingInhibited() {
-                switch controller.setChargingInhibited(false) {
-                case .success:
-                    return .success(false)
-                case .failure(let error):
-                    return .failure(error)
-                }
+            let res = controller.setChargingInhibited(false)
+            switch res {
+            case .success:
+                return .hardwareResume(floor: config.autoResumeChargeBelow)
+            case .failure:
+                return diagnostics.isCharging
+                    ? .nativePassthroughCharging(target: config.targetLimitPercent)
+                    : .nativePassthroughActive
             }
         }
 
-        return .success(controller.isChargingInhibited())
+        if controller.isChargingInhibited() {
+            return .hardwareInhibited(target: config.targetLimitPercent)
+        }
+
+        return diagnostics.isCharging
+            ? .nativePassthroughCharging(target: config.targetLimitPercent)
+            : .nativePassthroughActive
     }
 
-    /// Legacy convenience wrapper that evaluates battery state and returns the current charging inhibition status if the operation succeeded.
     public func evaluate(diagnostics: BatteryDiagnostics) -> Bool? {
-        switch evaluateWithResult(diagnostics: diagnostics) {
-        case .success(let state):
-            return state
-        case .failure:
+        let mode = evaluateMode(diagnostics: diagnostics)
+        switch mode {
+        case .hardwareInhibited:
+            return true
+        case .hardwareResume:
+            return false
+        case .nativePassthroughActive:
+            return true
+        case .nativePassthroughCharging, .disabled:
             return nil
+        case .batteryPower:
+            return false
+        }
+    }
+
+    public func evaluateWithResult(diagnostics: BatteryDiagnostics) -> Result<Bool?, SMCError> {
+        let mode = evaluateMode(diagnostics: diagnostics)
+        switch mode {
+        case .hardwareInhibited:
+            return .success(true)
+        case .hardwareResume:
+            return .success(false)
+        case .nativePassthroughActive:
+            return .success(true)
+        case .nativePassthroughCharging, .batteryPower, .disabled:
+            return .success(nil)
         }
     }
 

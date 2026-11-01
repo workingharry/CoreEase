@@ -54,7 +54,7 @@ final class ProcessViewModel: ObservableObject {
 
     @Published var batteryDiagnostics: BatteryDiagnostics = BatteryDiagnostics()
     @Published var bypassConfig = PowerBypassConfig()
-    @Published var bypassStatusMessage: String?
+    @Published var directPowerMode: DirectPowerMode = .disabled
 
     private var timer: AnyCancellable?
     private let policyStore = ThrottlePolicyStore.shared
@@ -66,10 +66,9 @@ final class ProcessViewModel: ObservableObject {
     }
 
     init() {
+        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        self.isOnBattery = !self.batteryDiagnostics.isExternalConnected
         self.suppressionEngine = AutoSuppressionEngine(config: autoSuppressConfig)
-        let liveDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
-        self.batteryDiagnostics = liveDiagnostics
-        self.isOnBattery = !liveDiagnostics.isExternalConnected
 
         refresh()
 
@@ -135,25 +134,16 @@ final class ProcessViewModel: ObservableObject {
     func updateBypassConfig(_ newConfig: PowerBypassConfig) {
         self.bypassConfig = newConfig
         self.bypassEngine.config = newConfig
-        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
-        self.isOnBattery = !self.batteryDiagnostics.isExternalConnected
         evaluateBypass()
     }
 
     func evaluateBypass() {
-        switch bypassEngine.evaluateWithResult(diagnostics: self.batteryDiagnostics) {
-        case .success(let inhibited):
-            if let inhibited = inhibited {
-                if inhibited {
-                    bypassStatusMessage = "Direct AC Power Active: Charging Paused at \(batteryDiagnostics.currentCapacityPercent)%"
-                } else {
-                    bypassStatusMessage = "Direct AC Standby: Charging Resumed below \(bypassConfig.autoResumeChargeBelow)%"
-                }
-            } else {
-                bypassStatusMessage = nil
-            }
-        case .failure(let error):
-            bypassStatusMessage = error.errorDescription ?? "⚠️ Direct AC requires root privileges"
+        self.directPowerMode = bypassEngine.evaluateMode(diagnostics: self.batteryDiagnostics)
+    }
+
+    func openBatterySystemSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.battery") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -408,16 +398,25 @@ struct DirectPowerBypassBanner: View {
         model.batteryDiagnostics
     }
 
+    var isPassthroughActive: Bool {
+        switch model.directPowerMode {
+        case .hardwareInhibited, .nativePassthroughActive:
+            return true
+        default:
+            return false
+        }
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: diag.isBypassActive ? "powerplug.fill" : "bolt.badge.clock.fill")
-                    .foregroundColor(diag.isBypassActive ? .blue : .orange)
+                Image(systemName: isPassthroughActive ? "powerplug.fill" : "bolt.badge.clock.fill")
+                    .foregroundColor(isPassthroughActive ? .blue : .orange)
                     .font(.system(size: 14))
 
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 6) {
-                        Text(diag.isBypassActive ? "Direct AC Power Active" : "AC Power Connected")
+                        Text(isPassthroughActive ? "Direct AC Power Active" : "AC Power Connected")
                             .font(.system(size: 11, weight: .bold))
                         
                         Text("Cycle: \(diag.cycleCount)")
@@ -435,11 +434,18 @@ struct DirectPowerBypassBanner: View {
                             .cornerRadius(3)
                     }
 
-                    Text(diag.isExternalConnected
-                         ? (diag.isCharging ? "Charging Battery (\(diag.currentCapacityPercent)%) • Target: \(model.bypassConfig.targetLimitPercent)%" : "100% External AC Powered • Battery Cycles Saved")
-                         : "Running on Internal Battery (\(diag.currentCapacityPercent)%)")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
+                    HStack(spacing: 4) {
+                        if !diag.isExternalConnected {
+                            Text("Running on Internal Battery (\(diag.currentCapacityPercent)%)")
+                        } else if isPassthroughActive {
+                            Text("100% External AC Powered (Passthrough) • 0 Battery Cycles Used")
+                                .foregroundColor(.blue)
+                        } else {
+                            Text("Charging Battery (\(diag.currentCapacityPercent)%) • Target: \(model.bypassConfig.targetLimitPercent)%")
+                        }
+                    }
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
                 }
 
                 Spacer()
@@ -458,7 +464,7 @@ struct DirectPowerBypassBanner: View {
 
             if model.bypassConfig.enabled && diag.isExternalConnected {
                 HStack(spacing: 6) {
-                    Text("Cap Charge at:")
+                    Text("Target Cap:")
                         .font(.system(size: 9))
                         .foregroundColor(.secondary)
                     
@@ -476,24 +482,25 @@ struct DirectPowerBypassBanner: View {
                         Text("85%").tag(85)
                     }
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 240)
+                    .frame(maxWidth: 220)
 
                     Spacer()
 
-                    if let msg = model.bypassStatusMessage {
-                        Text(msg)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(msg.hasPrefix("⚠️") ? .orange : .blue)
-                            .lineLimit(1)
-                    }
-                }
-            } else if let msg = model.bypassStatusMessage, msg.hasPrefix("⚠️") {
-                HStack {
-                    Text(msg)
+                    Button(action: {
+                        model.openBatterySystemSettings()
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "gearshape")
+                            Text("macOS 80% Limit Settings")
+                        }
                         .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.orange)
-                        .lineLimit(1)
-                    Spacer()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.12))
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open macOS Battery Settings to enable native 80% charge limit for permanent direct AC power")
                 }
             }
         }
