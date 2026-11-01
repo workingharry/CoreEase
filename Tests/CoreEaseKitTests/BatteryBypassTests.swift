@@ -96,4 +96,26 @@ final class BatteryBypassTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(diag.maxCapacityPercent, 0)
         XCTAssertGreaterThanOrEqual(diag.currentCapacityPercent, 0)
     }
+
+    func testSMCFallbackStrategiesAreDefined() {
+        let strategies = AppleSiliconSMCController.fallbackStrategies
+        XCTAssertFalse(strategies.isEmpty)
+        XCTAssertTrue(strategies.contains(where: { strategy in
+            strategy.contains(where: { $0.key == "CHTE" })
+        }))
+        XCTAssertTrue(strategies.contains(where: { strategy in
+            strategy.contains(where: { $0.key == "CH0B" })
+        }))
+    }
+
+    func testGenerateHelperInstallScript() {
+        let script = AppleSiliconSMCController.shared.generateHelperInstallScript()
+        XCTAssertTrue(script.contains("/usr/local/bin/coreease-helper"))
+        XCTAssertTrue(script.contains("sudoers.d"))
+        XCTAssertTrue(script.contains("CHTE"))
+    }
+
+    func testIsHelperInstalledDoesNotCrash() {
+        _ = AppleSiliconSMCController.shared.isHelperInstalled()
+    }
 }

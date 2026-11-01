@@ -147,6 +147,18 @@ final class ProcessViewModel: ObservableObject {
         }
     }
 
+    func installSMCHelper() {
+        let script = AppleSiliconSMCController.shared.generateHelperInstallScript()
+        let tempPath = "/tmp/install_coreease_helper.sh"
+        try? script.write(toFile: tempPath, atomically: true, encoding: .utf8)
+        let appleScript = "do shell script \"bash \(tempPath)\" with administrator privileges"
+        var error: NSDictionary?
+        if let scriptObj = NSAppleScript(source: appleScript) {
+            _ = scriptObj.executeAndReturnError(&error)
+        }
+        evaluateBypass()
+    }
+
     func refresh() {
         self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
         self.isOnBattery = !self.batteryDiagnostics.isExternalConnected
@@ -485,6 +497,36 @@ struct DirectPowerBypassBanner: View {
                     .frame(maxWidth: 220)
 
                     Spacer()
+
+                    if AppleSiliconSMCController.shared.isHelperInstalled() {
+                        HStack(spacing: 3) {
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundColor(.green)
+                            Text("Helper Active")
+                        }
+                        .font(.system(size: 9, weight: .medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.12))
+                        .cornerRadius(4)
+                        .help("Privileged SMC Helper is active. Direct hardware-level charge control enabled.")
+                    } else {
+                        Button(action: {
+                            model.installSMCHelper()
+                        }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "terminal")
+                                Text("Install SMC Helper")
+                            }
+                            .font(.system(size: 9, weight: .medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.12))
+                            .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Install privileged helper to /usr/local/bin/coreease-helper to enable direct hardware SMC battery bypass.")
+                    }
 
                     Button(action: {
                         model.openBatterySystemSettings()
