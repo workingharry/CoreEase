@@ -10,13 +10,13 @@ struct CoreEaseApp: App {
     var body: some Scene {
         MenuBarExtra("CoreEase", systemImage: model.isAutoSuppressionActive ? "leaf.arrow.triangle.circlepath" : "cpu") {
             ContentView(model: model)
-                .frame(width: 490, height: 580)
+                .frame(width: 490, height: 600)
         }
         .menuBarExtraStyle(.window)
 
         Window("CoreEase Dashboard", id: "main-dashboard") {
             LaunchWindowView(model: model)
-                .frame(minWidth: 620, minHeight: 620)
+                .frame(minWidth: 640, minHeight: 640)
         }
         .windowResizability(.contentSize)
     }
@@ -52,9 +52,14 @@ final class ProcessViewModel: ObservableObject {
     @Published var isOnBattery: Bool = false
     @Published var autoSuppressedPIDs: Set<Int32> = []
 
+    @Published var batteryDiagnostics: BatteryDiagnostics = BatteryDiagnostics()
+    @Published var bypassConfig = PowerBypassConfig()
+    @Published var bypassStatusMessage: String?
+
     private var timer: AnyCancellable?
     private let policyStore = ThrottlePolicyStore.shared
     private var suppressionEngine = AutoSuppressionEngine()
+    private var bypassEngine = BatteryBypassEngine(controller: AppleSiliconSMCController.shared)
 
     var isAutoSuppressionActive: Bool {
         return autoSuppressConfig.enabled && !autoSuppressedPIDs.isEmpty
@@ -63,6 +68,7 @@ final class ProcessViewModel: ObservableObject {
     init() {
         self.isOnBattery = PowerSourceMonitor.isOnBattery()
         self.suppressionEngine = AutoSuppressionEngine(config: autoSuppressConfig)
+        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
 
         refresh()
 
@@ -125,15 +131,36 @@ final class ProcessViewModel: ObservableObject {
         }
     }
 
+    func updateBypassConfig(_ newConfig: PowerBypassConfig) {
+        self.bypassConfig = newConfig
+        self.bypassEngine.config = newConfig
+        evaluateBypass()
+    }
+
+    func evaluateBypass() {
+        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        if let inhibited = bypassEngine.evaluate(diagnostics: self.batteryDiagnostics) {
+            if inhibited {
+                bypassStatusMessage = "Direct AC Power Active: Charging Paused at \(batteryDiagnostics.currentCapacityPercent)%"
+            } else {
+                bypassStatusMessage = "Direct AC Standby: Charging Resumed below \(bypassConfig.autoResumeChargeBelow)%"
+            }
+        } else {
+            bypassStatusMessage = nil
+        }
+    }
+
     func refresh() {
         self.isOnBattery = PowerSourceMonitor.isOnBattery()
+        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        evaluateBypass()
+
         let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         _ = suppressionEngine.updateFrontmostApp(pid: frontPID)
 
         let fetched = ProcessMonitor.shared.getTopProcesses(limit: 50)
         let savedPolicies = policyStore.getAllPolicies()
 
-        // O(1) dictionary lookup map
         let currentMap: [Int32: TrackedProcess] = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
 
         var merged: [TrackedProcess] = []
@@ -266,37 +293,36 @@ final class ProcessViewModel: ObservableObject {
     }
 
     func quitApplication() {
-        CPUThrottler.shared.stopAll()
-        NSApplication.shared.terminate(nil)
+        for proc in processes {
+            CPUThrottler.shared.stopThrottling(pid: proc.pid)
+            CoreScheduler.shared.resetToDefaultCores(pid: proc.pid)
+        }
+        _ = bypassEngine.controller.setChargingInhibited(false)
+        NSApp.terminate(nil)
     }
 }
 
-/// Standalone Full Launch Window View
-struct LaunchWindowView: View {
-    @ObservedObject var model: ProcessViewModel
-
-    var body: some View {
-        ContentView(model: model, isMainWindow: true)
-            .frame(minWidth: 620, minHeight: 620)
-    }
-}
-
-/// Consolidated Header with Distinctive Brand Identity
 struct AppBrandHeader: View {
     @ObservedObject var model: ProcessViewModel
 
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
+        HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(LinearGradient(colors: [Color(red: 0.12, green: 0.38, blue: 0.34), Color(red: 0.08, green: 0.22, blue: 0.25)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: 38, height: 38)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.12, green: 0.45, blue: 0.95),
+                                Color(red: 0.05, green: 0.72, blue: 0.60)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
+                    .frame(width: 36, height: 36)
+                    .shadow(color: Color.accentColor.opacity(0.35), radius: 5, x: 0, y: 2)
 
-                Image(systemName: model.isAutoSuppressionActive ? "leaf.arrow.triangle.circlepath" : "cpu.fill")
+                Image(systemName: "cpu")
                     .foregroundColor(Color(red: 0.35, green: 0.90, blue: 0.72))
                     .font(.system(size: 18, weight: .semibold))
             }
@@ -326,10 +352,21 @@ struct AppBrandHeader: View {
                         .padding(.vertical, 2)
                         .background(Color.green.opacity(0.12))
                         .clipShape(Capsule())
+                    } else {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                            Text("AC Power")
+                        }
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.blue)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.12))
+                        .clipShape(Capsule())
                     }
                 }
 
-                Text("Intelligent Core Scheduling & Dynamic CPU Throttling")
+                Text("Intelligent Core Scheduling & Direct AC Bypass Protection")
                     .font(.system(size: 11, weight: .regular))
                     .foregroundColor(.secondary)
             }
@@ -339,12 +376,12 @@ struct AppBrandHeader: View {
             Button(action: { model.quitApplication() }) {
                 HStack(spacing: 4) {
                     Image(systemName: "power")
-                    Text("Quit CoreEase")
+                    Text("Quit")
                 }
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.red.opacity(0.9))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
                 .background(Color.red.opacity(0.1))
                 .cornerRadius(6)
             }
@@ -352,8 +389,102 @@ struct AppBrandHeader: View {
             .help("Terminate CoreEase and restore full system clocks")
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 10)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+}
+
+struct DirectPowerBypassBanner: View {
+    @ObservedObject var model: ProcessViewModel
+
+    var diag: BatteryDiagnostics {
+        model.batteryDiagnostics
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: diag.isBypassActive ? "powerplug.fill" : "bolt.badge.clock.fill")
+                    .foregroundColor(diag.isBypassActive ? .blue : .orange)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 6) {
+                        Text(diag.isBypassActive ? "Direct AC Power Active" : "AC Power Connected")
+                            .font(.system(size: 11, weight: .bold))
+                        
+                        Text("Cycle: \(diag.cycleCount)")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15))
+                            .cornerRadius(3)
+                        
+                        Text("Health: \(diag.maxCapacityPercent)%")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15))
+                            .cornerRadius(3)
+                    }
+
+                    Text(diag.isExternalConnected
+                         ? (diag.isCharging ? "Charging Battery (\(diag.currentCapacityPercent)%) • Target: \(model.bypassConfig.targetLimitPercent)%" : "100% External AC Powered • Battery Cycles Saved")
+                         : "Running on Internal Battery (\(diag.currentCapacityPercent)%)")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { model.bypassConfig.enabled },
+                    set: { val in
+                        var cfg = model.bypassConfig
+                        cfg.enabled = val
+                        model.updateBypassConfig(cfg)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .scaleEffect(0.75)
+            }
+
+            if model.bypassConfig.enabled && diag.isExternalConnected {
+                HStack(spacing: 6) {
+                    Text("Cap Charge at:")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                    
+                    Picker("", selection: Binding(
+                        get: { model.bypassConfig.targetLimitPercent },
+                        set: { val in
+                            var cfg = model.bypassConfig
+                            cfg.targetLimitPercent = val
+                            model.updateBypassConfig(cfg)
+                        }
+                    )) {
+                        Text("70%").tag(70)
+                        Text("75%").tag(75)
+                        Text("80% (Recommended)").tag(80)
+                        Text("85%").tag(85)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 240)
+
+                    Spacer()
+
+                    if let msg = model.bypassStatusMessage {
+                        Text(msg)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.blue)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(Color.blue.opacity(0.08))
     }
 }
 
@@ -367,6 +498,8 @@ struct ContentView: View {
         VStack(spacing: 0) {
             AppBrandHeader(model: model)
 
+            DirectPowerBypassBanner(model: model)
+
             // Auto-Suppression Intelligent Banner
             HStack(spacing: 10) {
                 HStack(spacing: 6) {
@@ -375,13 +508,13 @@ struct ContentView: View {
 
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Auto-Battery Saver (Auto-Suppress)")
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                         Text(model.autoSuppressConfig.enabled
                              ? (model.isOnBattery
-                                ? "Active: Auto-throttling background tasks >\(Int(model.autoSuppressConfig.cpuThreshold))% CPU to save battery"
+                                ? "Active: Auto-throttling background tasks >\(Int(model.autoSuppressConfig.cpuThreshold))% CPU"
                                 : "Armed: Will activate automatically when running on Battery")
                              : "Disabled: Manual control mode")
-                            .font(.system(size: 10))
+                            .font(.system(size: 9))
                             .foregroundColor(.secondary)
                     }
                 }
@@ -397,33 +530,33 @@ struct ContentView: View {
                     }
                 ))
                 .toggleStyle(.switch)
-                .scaleEffect(0.8)
+                .scaleEffect(0.75)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
             .background(Color.accentColor.opacity(0.08))
 
             // Toolbar Controls
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundColor(.secondary)
                     TextField("Search running applications...", text: $model.searchText)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                 }
-                .padding(7)
+                .padding(6)
                 .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(7)
+                .cornerRadius(6)
 
                 Button(action: { model.refresh() }) {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                 }
                 .buttonStyle(.plain)
-                .padding(7)
+                .padding(6)
                 .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(7)
+                .cornerRadius(6)
                 .help("Refresh task list")
 
                 if !isMainWindow {
@@ -432,162 +565,161 @@ struct ContentView: View {
                         NSApp.activate(ignoringOtherApps: true)
                     }) {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                     }
                     .buttonStyle(.plain)
-                    .padding(7)
+                    .padding(6)
                     .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(7)
+                    .cornerRadius(6)
                     .help("Open in standalone Launch Dashboard window")
                 }
 
                 Button(action: { showSettings.toggle() }) {
                     Image(systemName: showSettings ? "gearshape.fill" : "gearshape")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 11, weight: .medium))
                 }
                 .buttonStyle(.plain)
-                .padding(7)
+                .padding(6)
                 .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(7)
-                .help("Settings & Automation Rules")
+                .cornerRadius(6)
+                .help("Preferences & settings")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+
+            if showSettings {
+                SettingsDrawer(model: model)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            // Fixed Position Process List
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.filteredProcesses) { proc in
+                        ProcessCard(
+                            proc: proc,
+                            model: model,
+                            isAutoSuppressed: model.autoSuppressedPIDs.contains(proc.pid)
+                        )
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+            }
+
+            // Footer
+            HStack {
+                Text("\(model.filteredProcesses.count) processes • \(model.processes.filter { $0.isEfficiencyClamped }.count) on E-Cores • \(model.processes.filter { $0.throttleLimitPercent != nil }.count) throttled")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                Button("Quit CoreEase") {
+                    model.quitApplication()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.red)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .background(Color(NSColor.windowBackgroundColor))
+        }
+    }
+}
 
-            if showSettings {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Auto-Suppression Rules")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.secondary)
+struct SettingsDrawer: View {
+    @ObservedObject var model: ProcessViewModel
 
-                    HStack {
-                        Toggle("Only on Battery Power", isOn: Binding(
-                            get: { model.autoSuppressConfig.onlyOnBattery },
-                            set: { val in
-                                var cfg = model.autoSuppressConfig
-                                cfg.onlyOnBattery = val
-                                model.updateAutoSuppressConfig(cfg)
-                            }
-                        ))
-                        .font(.caption)
-
-                        Spacer()
-
-                        Toggle("Pin to E-Cores (Eco)", isOn: Binding(
-                            get: { model.autoSuppressConfig.autoEcoClamp },
-                            set: { val in
-                                var cfg = model.autoSuppressConfig
-                                cfg.autoEcoClamp = val
-                                model.updateAutoSuppressConfig(cfg)
-                            }
-                        ))
-                        .font(.caption)
-                    }
-
-                    HStack {
-                        Text("Trigger Threshold:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Slider(
-                            value: Binding(
-                                get: { model.autoSuppressConfig.cpuThreshold },
-                                set: { val in
-                                    var cfg = model.autoSuppressConfig
-                                    cfg.cpuThreshold = val
-                                    model.updateAutoSuppressConfig(cfg)
-                                }
-                            ),
-                            in: 50...90,
-                            step: 5
-                        )
-                        Text(">\(Int(model.autoSuppressConfig.cpuThreshold))% CPU")
-                            .font(.system(size: 10, design: .monospaced))
-                    }
-
-                    Divider()
-
-                    HStack {
-                        Text("Sort Order:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Picker("", selection: $model.sortMode) {
-                            ForEach(ProcessSortMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: model.sortMode) { _ in
-                            model.refresh()
-                        }
-                    }
-
-                    Toggle(isOn: $model.showSystemServices) {
-                        Text("Show System & Protected Daemons (Advanced)")
-                            .font(.caption)
-                    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("App Preferences")
+                    .font(.system(size: 11, weight: .bold))
+                Spacer()
+                Toggle("Auto-Refresh (2.5s)", isOn: $model.autoRefresh)
                     .toggleStyle(.checkbox)
-                }
-                .padding(10)
-                .background(Color(NSColor.controlBackgroundColor).opacity(0.85))
-                .cornerRadius(6)
-                .padding([.horizontal, .bottom], 12)
-            }
-
-            Divider()
-
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    if model.filteredProcesses.isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: "tray")
-                                .font(.system(size: 28))
-                                .foregroundColor(.secondary)
-                            Text("No matching applications found")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.top, 40)
-                    } else {
-                        ForEach(model.filteredProcesses) { proc in
-                            ProcessCard(
-                                proc: proc,
-                                model: model,
-                                isAutoSuppressed: model.autoSuppressedPIDs.contains(proc.pid)
-                            )
-                        }
-                    }
-                }
-                .padding(12)
+                    .font(.system(size: 10))
             }
 
             Divider()
 
             HStack {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(model.isAutoSuppressionActive ? Color.green : Color.secondary)
-                        .frame(width: 6, height: 6)
-                    Text(model.isAutoSuppressionActive
-                         ? "🛡️ Auto-suppressing \(model.autoSuppressedPIDs.count) heavy background app(s)"
-                         : "🌿 Eco Mode: Apple Silicon Efficiency Cores")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.secondary)
+                Text("Process List Sorting:")
+                    .font(.system(size: 10, weight: .medium))
+                Picker("", selection: $model.sortMode) {
+                    ForEach(ProcessSortMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
                 }
-
-                Spacer()
-
-                Button("Quit") {
-                    model.quitApplication()
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.red)
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 240)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(Color(NSColor.windowBackgroundColor))
+
+            Toggle("Show macOS System Services & Daemons", isOn: $model.showSystemServices)
+                .toggleStyle(.checkbox)
+                .font(.system(size: 10))
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Auto-Battery Saver Tuning")
+                    .font(.system(size: 10, weight: .bold))
+
+                HStack {
+                    Text("Trigger Threshold:")
+                        .font(.system(size: 10))
+                    Slider(
+                        value: Binding(
+                            get: { model.autoSuppressConfig.cpuThreshold },
+                            set: { val in
+                                var cfg = model.autoSuppressConfig
+                                cfg.cpuThreshold = val
+                                model.updateAutoSuppressConfig(cfg)
+                            }
+                        ),
+                        in: 40...95,
+                        step: 5
+                    )
+                    Text("\(Int(model.autoSuppressConfig.cpuThreshold))% CPU")
+                        .font(.system(size: 10, design: .monospaced))
+                        .frame(width: 50)
+                }
+
+                HStack {
+                    Text("Target Throttle Cap:")
+                        .font(.system(size: 10))
+                    Slider(
+                        value: Binding(
+                            get: { Double(model.autoSuppressConfig.autoThrottleLimit) },
+                            set: { val in
+                                var cfg = model.autoSuppressConfig
+                                cfg.autoThrottleLimit = Int(val)
+                                model.updateAutoSuppressConfig(cfg)
+                            }
+                        ),
+                        in: 30...85,
+                        step: 5
+                    )
+                    Text("\(model.autoSuppressConfig.autoThrottleLimit)%")
+                        .font(.system(size: 10, design: .monospaced))
+                        .frame(width: 50)
+                }
+            }
         }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.85))
+        .cornerRadius(6)
+        .padding(.horizontal, 14)
+    }
+}
+
+struct LaunchWindowView: View {
+    @ObservedObject var model: ProcessViewModel
+
+    var body: some View {
+        ContentView(model: model, isMainWindow: true)
     }
 }
 
@@ -616,7 +748,7 @@ struct ProcessCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Image(systemName: proc.safetyTier.badgeIcon)
                     .foregroundColor(proc.safetyTier == .protectedSystem ? .red : (proc.safetyTier == .cautionDaemon ? .orange : .green))
@@ -624,7 +756,7 @@ struct ProcessCard: View {
                     .imageScale(.medium)
 
                 Text(proc.name)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
 
                 if isAutoSuppressed {
@@ -713,8 +845,8 @@ struct ProcessCard: View {
                 }
             }
         }
-        .padding(9)
+        .padding(8)
         .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(7)
+        .cornerRadius(6)
     }
 }
