@@ -48,10 +48,21 @@ public struct PowerBypassConfig: Codable, Sendable, Equatable {
     }
 }
 
-public enum SMCError: Error, Equatable {
+public enum SMCError: Error, Equatable, LocalizedError, Sendable {
     case notPrivileged(String)
     case deviceNotFound
     case keyNotFound
+
+    public var errorDescription: String? {
+        switch self {
+        case .notPrivileged(let detail):
+            return "⚠️ Direct AC requires root privileges (\(detail))"
+        case .deviceNotFound:
+            return "⚠️ Direct AC unavailable: AppleSMC device not found"
+        case .keyNotFound:
+            return "⚠️ Direct AC unsupported: SMC key CH0B not found"
+        }
+    }
 }
 
 public protocol SMCChargingControllerProtocol: AnyObject, Sendable {
@@ -61,9 +72,11 @@ public protocol SMCChargingControllerProtocol: AnyObject, Sendable {
 
 public final class MockSMCChargingController: SMCChargingControllerProtocol, @unchecked Sendable {
     public var inhibited: Bool = false
+    public var simulatedError: SMCError?
 
-    public init(inhibited: Bool = false) {
+    public init(inhibited: Bool = false, simulatedError: SMCError? = nil) {
         self.inhibited = inhibited
+        self.simulatedError = simulatedError
     }
 
     public func isChargingInhibited() -> Bool {
@@ -71,6 +84,9 @@ public final class MockSMCChargingController: SMCChargingControllerProtocol, @un
     }
 
     public func setChargingInhibited(_ inhibited: Bool) -> Result<Void, SMCError> {
+        if let error = simulatedError {
+            return .failure(error)
+        }
         self.inhibited = inhibited
         return .success(())
     }
@@ -88,36 +104,63 @@ public final class BatteryBypassEngine: @unchecked Sendable {
         self.controller = controller
     }
 
-    public func evaluate(diagnostics: BatteryDiagnostics) -> Bool? {
+    /// Evaluates battery state and returns a Result containing the inhibited state (`true` = paused, `false` = charging, `nil` = inactive) or an `SMCError` if SMC modification fails.
+    public func evaluateWithResult(diagnostics: BatteryDiagnostics) -> Result<Bool?, SMCError> {
         guard config.enabled else {
             if controller.isChargingInhibited() {
-                _ = controller.setChargingInhibited(false)
-                return false
+                switch controller.setChargingInhibited(false) {
+                case .success:
+                    return .success(false)
+                case .failure(let error):
+                    return .failure(error)
+                }
             }
-            return nil
+            return .success(nil)
         }
 
         guard diagnostics.isExternalConnected else {
             if controller.isChargingInhibited() {
-                _ = controller.setChargingInhibited(false)
-                return false
+                switch controller.setChargingInhibited(false) {
+                case .success:
+                    return .success(false)
+                case .failure(let error):
+                    return .failure(error)
+                }
             }
-            return nil
+            return .success(nil)
         }
 
         if diagnostics.currentCapacityPercent >= config.targetLimitPercent {
             if !controller.isChargingInhibited() {
-                _ = controller.setChargingInhibited(true)
-                return true
+                switch controller.setChargingInhibited(true) {
+                case .success:
+                    return .success(true)
+                case .failure(let error):
+                    return .failure(error)
+                }
             }
         } else if diagnostics.currentCapacityPercent <= config.autoResumeChargeBelow {
             if controller.isChargingInhibited() {
-                _ = controller.setChargingInhibited(false)
-                return false
+                switch controller.setChargingInhibited(false) {
+                case .success:
+                    return .success(false)
+                case .failure(let error):
+                    return .failure(error)
+                }
             }
         }
 
-        return controller.isChargingInhibited()
+        return .success(controller.isChargingInhibited())
+    }
+
+    /// Legacy convenience wrapper that evaluates battery state and returns the current charging inhibition status if the operation succeeded.
+    public func evaluate(diagnostics: BatteryDiagnostics) -> Bool? {
+        switch evaluateWithResult(diagnostics: diagnostics) {
+        case .success(let state):
+            return state
+        case .failure:
+            return nil
+        }
     }
 
     public static func readLiveDiagnostics() -> BatteryDiagnostics {

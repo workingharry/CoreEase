@@ -66,9 +66,10 @@ final class ProcessViewModel: ObservableObject {
     }
 
     init() {
-        self.isOnBattery = PowerSourceMonitor.isOnBattery()
         self.suppressionEngine = AutoSuppressionEngine(config: autoSuppressConfig)
-        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        let liveDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        self.batteryDiagnostics = liveDiagnostics
+        self.isOnBattery = !liveDiagnostics.isExternalConnected
 
         refresh()
 
@@ -134,25 +135,31 @@ final class ProcessViewModel: ObservableObject {
     func updateBypassConfig(_ newConfig: PowerBypassConfig) {
         self.bypassConfig = newConfig
         self.bypassEngine.config = newConfig
+        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        self.isOnBattery = !self.batteryDiagnostics.isExternalConnected
         evaluateBypass()
     }
 
     func evaluateBypass() {
-        self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
-        if let inhibited = bypassEngine.evaluate(diagnostics: self.batteryDiagnostics) {
-            if inhibited {
-                bypassStatusMessage = "Direct AC Power Active: Charging Paused at \(batteryDiagnostics.currentCapacityPercent)%"
+        switch bypassEngine.evaluateWithResult(diagnostics: self.batteryDiagnostics) {
+        case .success(let inhibited):
+            if let inhibited = inhibited {
+                if inhibited {
+                    bypassStatusMessage = "Direct AC Power Active: Charging Paused at \(batteryDiagnostics.currentCapacityPercent)%"
+                } else {
+                    bypassStatusMessage = "Direct AC Standby: Charging Resumed below \(bypassConfig.autoResumeChargeBelow)%"
+                }
             } else {
-                bypassStatusMessage = "Direct AC Standby: Charging Resumed below \(bypassConfig.autoResumeChargeBelow)%"
+                bypassStatusMessage = nil
             }
-        } else {
-            bypassStatusMessage = nil
+        case .failure(let error):
+            bypassStatusMessage = error.errorDescription ?? "⚠️ Direct AC requires root privileges"
         }
     }
 
     func refresh() {
-        self.isOnBattery = PowerSourceMonitor.isOnBattery()
         self.batteryDiagnostics = BatteryBypassEngine.readLiveDiagnostics()
+        self.isOnBattery = !self.batteryDiagnostics.isExternalConnected
         evaluateBypass()
 
         let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -476,9 +483,17 @@ struct DirectPowerBypassBanner: View {
                     if let msg = model.bypassStatusMessage {
                         Text(msg)
                             .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(.blue)
+                            .foregroundColor(msg.hasPrefix("⚠️") ? .orange : .blue)
                             .lineLimit(1)
                     }
+                }
+            } else if let msg = model.bypassStatusMessage, msg.hasPrefix("⚠️") {
+                HStack {
+                    Text(msg)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.orange)
+                        .lineLimit(1)
+                    Spacer()
                 }
             }
         }

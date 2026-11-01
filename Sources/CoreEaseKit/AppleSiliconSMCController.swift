@@ -6,7 +6,6 @@ public final class AppleSiliconSMCController: SMCChargingControllerProtocol, @un
 
     private let smcKernelIndex: UInt32 = 2
     private let smcCmdWriteBytes: UInt8 = 5
-    private let smcCmdReadBytes: UInt8 = 5
     private let smcCmdKeyInfo: UInt8 = 9
 
     private struct SMCVersion {
@@ -76,7 +75,6 @@ public final class AppleSiliconSMCController: SMCChargingControllerProtocol, @un
         IOObjectRelease(service)
 
         guard openRes == KERN_SUCCESS else {
-            simulatedInhibited = inhibited
             return .failure(.notPrivileged("Requires root privileges to open AppleSMC user client."))
         }
 
@@ -91,7 +89,6 @@ public final class AppleSiliconSMCController: SMCChargingControllerProtocol, @un
 
         let infoRes = IOConnectCallStructMethod(conn, 2, &input, structSize, &output, &structSize)
         if infoRes != KERN_SUCCESS {
-            simulatedInhibited = inhibited
             return .failure(.keyNotFound)
         }
 
@@ -107,7 +104,6 @@ public final class AppleSiliconSMCController: SMCChargingControllerProtocol, @un
             simulatedInhibited = inhibited
             return .success(())
         } else {
-            simulatedInhibited = inhibited
             return .failure(.notPrivileged("SMC write blocked (0x\(String(writeRes, radix: 16)))."))
         }
     }
